@@ -75,7 +75,6 @@
  */
 #define NPU_PT_TEST		(0)
 
-#define INFER_TASK_PRI		(15)
 #define INFER_TASK_STKSZ	(8 * 1024)
 #define START_WAIT_MS		(30000)		/* usermain が自己テストの終わりを待つ上限 */
 
@@ -127,6 +126,17 @@ LOCAL UW	pp_us_max, pp_us_sum, inf_us_max, inf_us_sum;
 LOCAL INT	last_cls = AED_CLS_UNKNOWN;	/* 窓の1行に出すための、直前の判定 */
 LOCAL INT	last_p100;
 
+#if INFER_SLOW_X > 1
+/*
+ * 条件 D (infer_task.h の INFER_SLOW_X)。窓 1 つの実測 (前処理+推論+空回し) と空回しの統計を
+ * show_summary の 1 行 (このビルドだけ) に出す
+ */
+LOCAL UW	win_us_max, win_us_sum;			/* 窓 1 つの処理時間 (前処理+推論+空回し) の最大・合計 (us) */
+LOCAL UW	spin_n, spin_us_max, spin_us_sum;	/* 空回しの回数・最大・合計 (us) */
+LOCAL UW	spin_skipped;				/* READY 前・トレース未完・CYCCNT 無効で飛ばした窓 */
+LOCAL UW	slow_spin(UW base_us);			/* 戻り値: 実際に回した時間 (us)。飛ばしたら 0 */
+#endif
+
 /*
  * 窓1つを処理する。preproc_run → npu_rt_infer → notify_decide → notify_window。
  * 通知 (JSON と LED) は notify_window が行う
@@ -154,6 +164,17 @@ LOCAL BOOL process_window(const TAP_WIN_INFO *info, UW peak, UW *pp_us, UW *inf_
 	inf_us_sum += *inf_us;
 	if(*pp_us > pp_us_max)   pp_us_max  = *pp_us;
 	if(*inf_us > inf_us_max) inf_us_max = *inf_us;
+
+#if INFER_SLOW_X > 1
+	{
+		/* 条件 D: 推論が遅い状態を作る。判定・通知より前なので JSON の lat_ms にこの遅れがそのまま載る */
+		UW	spin_us = slow_spin(*pp_us + *inf_us);
+		UW	win_us  = *pp_us + *inf_us + spin_us;	/* 窓 1 つの実測 */
+
+		win_us_sum += win_us;
+		if(win_us > win_us_max) win_us_max = win_us;
+	}
+#endif
 
 	/*
 	 * 診断の1行にはゲートより前の判定を出す (窓の 1位が何だったかは残したい)。
@@ -252,6 +273,12 @@ LOCAL void show_summary(const char *why)
 	log_printf("  preproc max=%uus avg=%uus | infer max=%uus avg=%uus\n",
 			pp_us_max, (run_n > 0) ? pp_us_sum / run_n : 0,
 			inf_us_max, (run_n > 0) ? inf_us_sum / run_n : 0);
+#if INFER_SLOW_X > 1
+	/* 条件 D だけ: 窓 1 つの実測 (前処理+推論+空回し) と空回しの内訳 */
+	log_printf("  slow x%d: window max=%uus avg=%uus | spin n=%u max=%uus avg=%uus skipped=%u\n",
+			INFER_SLOW_X, win_us_max, (run_n > 0) ? win_us_sum / run_n : 0,
+			spin_n, spin_us_max, (spin_n > 0) ? spin_us_sum / spin_n : 0, spin_skipped);
+#endif
 	/*
 	 * 判定の内訳: out=出した行 / held=続いた unknown で出さなかった窓 /
 	 * offlist=通知対象外のクラスだった窓 / gated=音量の門で止めた窓
@@ -580,6 +607,43 @@ LOCAL void show_ready_banner(BOOL npu_ok)
 	log_block_begin("READY  起動確認おわり。ここから本番");
 	ready_shown = TRUE;
 }
+
+#if INFER_SLOW_X > 1
+/*
+ * 空回し (条件 D)。窓 1 つの処理が (前処理+推論)×INFER_SLOW_X になるように base_us×(X-1) だけ DWT で回す。
+ *   - READY の後 (ready_shown) から。起動確認 (トレースの CSV ダンプ・前処理セルフテスト) を
+ *     遅らせないため。READY はダンプ待ち (TRACE_FULL) の隙間にも出得る (trace_busy は FULL で
+ *     FALSE) ので trace_state() が IDLE になるまでも待つ。dump は優先度 32 で、空回しが始まると動けない
+ *   - CYCCNT が動いていなければ飛ばす (while から抜けられなくなる)
+ *   - 1 回の上限は SLOW_SPIN_MAX_US。UW の差分は 2^32 サイクル (600MHz で約 7.16 秒) で折り返す
+ *   - 中で tk_dly_tsk 等の待ちは入れない (CPU を離さないのが目的)。DI/EI も掛けない
+ *     (音声の ISR と周期ハンドラは動き続ける)
+ */
+#define SLOW_SPIN_MAX_US	(3000000)	/* 3 秒。2^31 サイクル (約 3.58 秒) より下 */
+
+LOCAL UW slow_spin(UW base_us)
+{
+	UW	t0, want_us, cyc, us;
+
+	if(!ready_shown || trace_state() != TRACE_IDLE || !trace_cyccnt_valid()) {
+		spin_skipped++;
+		return 0;
+	}
+	want_us = base_us * (UW)(INFER_SLOW_X - 1);
+	if(want_us > SLOW_SPIN_MAX_US) want_us = SLOW_SPIN_MAX_US;
+	cyc = want_us * trace_cyc_per_us();
+
+	t0 = NOW();
+	while((UW)(NOW() - t0) < cyc) {
+		/* DWT を読むだけ */
+	}
+	us = trace_cyc_to_us((UW)(NOW() - t0));
+	spin_n++;
+	spin_us_sum += us;
+	if(us > spin_us_max) spin_us_max = us;
+	return us;
+}
+#endif	/* INFER_SLOW_X > 1 */
 
 /* ---------------------------------------------------------------- */
 

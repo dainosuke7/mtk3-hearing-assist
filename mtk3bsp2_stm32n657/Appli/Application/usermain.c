@@ -185,6 +185,11 @@ EXPORT INT usermain(void)
 	/* DWT CYCCNT を起こす。以降の計測はすべてこれが基準 */
 	trace_init();
 
+	/* どの条件のログかを最初の行で分かるようにする (npu/infer_task.h の対照実験のスイッチ)。
+	 * まだレポータが無いので直接 UART に出る = 後で reporter が飢えても消えない */
+	tm_printf((UB*)"CONFIG: %s (INFER_PRIO_INVERT=%d INFER_SLOW_X=%d task_infer pri %d)\n",
+			INFER_CONFIG_NAME, INFER_PRIO_INVERT, INFER_SLOW_X, INFER_TASK_PRI);
+
 	tm_putstring((UB*)"Start User-main program.\n");
 
 	/* HAL のタイムアウトを効かせる。HAL を使う初期化 (extflash, WM8904) より前に */
